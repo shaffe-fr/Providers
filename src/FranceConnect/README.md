@@ -15,6 +15,7 @@ Please see the [Base Installation Guide](https://socialiteproviders.com/usage/),
   'client_id' => env('FRANCECONNECT_CLIENT_ID'),  
   'client_secret' => env('FRANCECONNECT_CLIENT_SECRET'),  
   'redirect' => env('FRANCECONNECT_REDIRECT_URI') 
+  'logout_redirect' => env('FRANCECONNECT_LOGOUT_REDIRECT_URI') 
 ],
 ```
 

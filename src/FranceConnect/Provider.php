@@ -13,21 +13,16 @@ class Provider extends AbstractProvider
     /**
      * API URLs.
      */
-    public const PROD_BASE_URL = 'https://app.franceconnect.gouv.fr/api/v1';
+    public const PROD_BASE_URL = 'https://oidc.franceconnect.gouv.fr/api/v2';
 
-    public const TEST_BASE_URL = 'https://fcp.integ01.dev-franceconnect.fr/api/v1';
+    public const TEST_BASE_URL = 'https://fcp-low.integ01.dev-franceconnect.fr/api/v2';
 
     public const IDENTIFIER = 'FRANCECONNECT';
 
     protected $scopes = [
         'openid',
-        'given_name',
-        'family_name',
-        'gender',
-        'birthplace',
-        'birthcountry',
+        'profile',
         'email',
-        'preferred_username',
     ];
 
     protected $scopeSeparator = ' ';
@@ -37,7 +32,7 @@ class Provider extends AbstractProvider
      *
      * @return string
      */
-    protected function getBaseUrl()
+    protected function getBaseUrl(): string
     {
         return config('app.env') === 'production' ? self::PROD_BASE_URL : self::TEST_BASE_URL;
     }
@@ -50,14 +45,27 @@ class Provider extends AbstractProvider
     protected function getAuthUrl($state): string
     {
         //It is used to prevent replay attacks
-        $this->parameters['nonce'] = Str::random(20);
+        $this->parameters['nonce'] = Str::random(22);
 
-        return $this->buildAuthUrlFromBase($this->getBaseUrl().'/authorize', $state);
+        return $this->buildAuthUrlFromBase($this->getBaseUrl() . '/authorize', $state);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    protected function getCodeFields($state = null): array
+    {
+        $fields = parent::getCodeFields($state);
+
+        $fields['acr_values'] = 'eidas1';
+        $fields['prompt'] = 'consent';
+
+        return $fields;
     }
 
     protected function getTokenUrl(): string
     {
-        return $this->getBaseUrl().'/token';
+        return $this->getBaseUrl() . '/token';
     }
 
     /**
@@ -65,8 +73,8 @@ class Provider extends AbstractProvider
      */
     public function getAccessTokenResponse($code)
     {
-        $response = $this->getHttpClient()->post($this->getBaseUrl().'/token', [
-            RequestOptions::HEADERS     => ['Authorization' => 'Basic '.base64_encode($this->clientId.':'.$this->clientSecret)],
+        $response = $this->getHttpClient()->post($this->getBaseUrl() . '/token', [
+            RequestOptions::HEADERS     => ['Authorization' => 'Basic ' . base64_encode($this->clientId . ':' . $this->clientSecret)],
             RequestOptions::FORM_PARAMS => $this->getTokenFields($code),
         ]);
 
@@ -102,9 +110,9 @@ class Provider extends AbstractProvider
      */
     protected function getUserByToken($token)
     {
-        $response = $this->getHttpClient()->get($this->getBaseUrl().'/userinfo', [
+        $response = $this->getHttpClient()->get($this->getBaseUrl() . '/userinfo', [
             RequestOptions::HEADERS => [
-                'Authorization' => 'Bearer '.$token,
+                'Authorization' => 'Bearer ' . $token,
             ],
         ]);
 
@@ -131,13 +139,13 @@ class Provider extends AbstractProvider
     /**
      *  Generate logout URL for redirection to FranceConnect.
      */
-    public function generateLogoutURL()
+    public function generateLogoutURL(): string
     {
         $params = [
             'post_logout_redirect_uri' => $this->getConfig('logout_redirect'),
             'id_token_hint'            => $this->request->session()->get('fc_token_id'),
         ];
 
-        return $this->getBaseUrl().'/logout?'.http_build_query($params);
+        return $this->getBaseUrl() . '/session/end?' . http_build_query($params);
     }
 }
