@@ -1,58 +1,148 @@
-# FranceConnect
+# SocialiteProviders / FranceConnect
+
+A Laravel Socialite provider for FranceConnect (OpenID Connect v2), supporting both production and integration environments.
+
+---
+
+## Installation
+
+Install via Composer:
 
 ```bash
 composer require socialiteproviders/franceconnect
 ```
 
-## Installation & Basic Usage
+---
 
-Please see the [Base Installation Guide](https://socialiteproviders.com/usage/), then follow the provider specific instructions below.
+## Configuration
 
-### Add configuration to `config/services.php`
+### 1. Add to `config/services.php`
 
 ```php
-'franceconnect' => [    
-  'client_id' => env('FRANCECONNECT_CLIENT_ID'),  
-  'client_secret' => env('FRANCECONNECT_CLIENT_SECRET'),  
-  'redirect' => env('FRANCECONNECT_REDIRECT_URI') 
+'franceconnect' => [
+    'client_id'        => env('FC_CLIENT_ID'),
+    'client_secret'    => env('FC_CLIENT_SECRET'),
+    'redirect'         => env('FC_REDIRECT_URI'),
+    'logout_redirect'  => env('FC_LOGOUT_REDIRECT_URI'),
 ],
 ```
 
-### Add provider event listener
+### 2. Add to `.env`
 
-#### Laravel 11+
+```ini
+FC_CLIENT_ID=
+FC_CLIENT_SECRET=
+FC_REDIRECT_URI=
+FC_LOGOUT_REDIRECT_URI=
+```
 
-In Laravel 11, the default `EventServiceProvider` provider was removed. Instead, add the listener using the `listen` method on the `Event` facade, in your `AppServiceProvider` `boot` method.
+---
 
-* Note: You do not need to add anything for the built-in socialite providers unless you override them with your own providers.
+## Register the Provider
+
+### Laravel 11+
+
+In Laravel 11, the `EventServiceProvider` is removed by default. Instead, register Socialite providers in `AppServiceProvider`:
 
 ```php
-Event::listen(function (\SocialiteProviders\Manager\SocialiteWasCalled $event) {
-    $event->extendSocialite('franceconnect', \SocialiteProviders\FranceConnect\Provider::class);
-});
-```
-<details>
-<summary>
-Laravel 10 or below
-</summary>
-Configure the package's listener to listen for `SocialiteWasCalled` events.
+use Illuminate\Support\Facades\Event;
+use SocialiteProviders\Manager\SocialiteWasCalled;
 
-Add the event to your `listen[]` array in `app/Providers/EventServiceProvider`. See the [Base Installation Guide](https://socialiteproviders.com/usage/) for detailed instructions.
+public function boot()
+{
+    Event::listen(SocialiteWasCalled::class, function ($event) {
+        $event->extendSocialite(
+            'franceconnect',
+            \SocialiteProviders\FranceConnect\Provider::class
+        );
+    });
+}
+```
+
+### Laravel 10 and Below
+
+In `app/Providers/EventServiceProvider.php`:
 
 ```php
 protected $listen = [
     \SocialiteProviders\Manager\SocialiteWasCalled::class => [
-        // ... other providers
-        \SocialiteProviders\FranceConnect\FranceConnectExtendSocialite::class.'@handle',
+        \SocialiteProviders\FranceConnect\FranceConnectExtendSocialite::class . '@handle',
     ],
 ];
 ```
-</details>
 
-### Usage
+---
 
-You should now be able to use the provider like you would regularly use Socialite (assuming you have the facade installed):
+## Usage
+
+Use FranceConnect like any other Socialite driver:
 
 ```php
-return Socialite::driver('franceconnect')->redirect();
+use Laravel\Socialite\Facades\Socialite;
+
+// Redirect to FranceConnect
+default public function redirectToFranceConnect()
+{
+    return Socialite::driver('franceconnect')->redirect();
+}
+
+// Handle FranceConnect callback
+public function handleFranceConnectCallback()
+{
+    $user = Socialite::driver('franceconnect')
+        ->stateless() // Remove for session-based state/nonce handling
+        ->user();
+
+    // Save ID token for logout later
+    session(['fc_id_token' => $user->refreshToken]);
+
+    // Access tokens:
+    // $user->token, $user->refreshToken, $user->refreshToken, $user->getRaw()
+}
 ```
+
+> **Tip:** Remove `stateless()` if you want automatic state and nonce validation.
+
+---
+
+## Logout
+
+FranceConnect Single Logout (SLO) uses the OpenID end-session endpoint.
+
+The driver provides:
+
+```php
+getLogoutUrl(string $idToken): string
+```
+
+### Example
+
+First, ensure you store the `id_token` after login:
+
+```php
+session(['fc_id_token' => $user->refreshToken]);
+```
+
+Then generate the logout URL:
+
+```php
+use Laravel\Socialite\Facades\Socialite;
+
+public function logoutFromFranceConnect()
+{
+    $idToken = session('fc_id_token');
+
+    if (!$idToken) {
+        abort(400, 'No ID Token found in session.');
+    }
+
+    $logoutUrl = Socialite::driver('franceconnect')
+        ->getLogoutUrl($idToken);
+
+    return redirect()->away($logoutUrl);
+}
+```
+
+> ✅ The `id_token` is mandatory for FranceConnect logout.
+
+---

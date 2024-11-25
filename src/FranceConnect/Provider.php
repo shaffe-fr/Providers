@@ -2,62 +2,90 @@
 
 namespace SocialiteProviders\FranceConnect;
 
+use Firebase\JWT\JWT;
 use GuzzleHttp\RequestOptions;
+use Illuminate\Http\Request;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Str;
 use Laravel\Socialite\Two\InvalidStateException;
 use SocialiteProviders\Manager\OAuth2\AbstractProvider;
+use SocialiteProviders\Manager\OAuth2\User;
 
 class Provider extends AbstractProvider
 {
     /**
-     * API URLs.
+     * Provider identifier.
      */
-    public const PROD_BASE_URL = 'https://app.franceconnect.gouv.fr/api/v1';
-
-    public const TEST_BASE_URL = 'https://fcp.integ01.dev-franceconnect.fr/api/v1';
-
     public const IDENTIFIER = 'FRANCECONNECT';
 
-    protected $scopes = [
-        'openid',
-        'given_name',
-        'family_name',
-        'gender',
-        'birthplace',
-        'birthcountry',
-        'email',
-        'preferred_username',
+    /**
+     * Base URLs for production and integration.
+     */
+    private const URLS = [
+        'production' => 'https://oidc.franceconnect.gouv.fr/api/v2',
+        'integration' => 'https://fcp-low.integ01.dev-franceconnect.fr/api/v2',
     ];
 
+    /**
+     * {@inheritdoc}
+     */
+    protected $scopes = [
+        'openid',
+        'profile',
+        'email',
+    ];
+
+    /**
+     * {@inheritdoc}
+     */
     protected $scopeSeparator = ' ';
 
     /**
-     * Return API Base URL.
-     *
-     * @return string
+     * Override to allow custom config keys.
      */
-    protected function getBaseUrl()
-    {
-        return config('app.env') === 'production' ? self::PROD_BASE_URL : self::TEST_BASE_URL;
-    }
-
     public static function additionalConfigKeys(): array
     {
-        return ['logout_redirect'];
+        return ['logout_redirect', 'environment', 'acr_values', 'prompt'];
     }
 
+    /**
+     * {@inheritdoc}
+     */
     protected function getAuthUrl($state): string
     {
-        //It is used to prevent replay attacks
-        $this->parameters['nonce'] = Str::random(20);
+        // generate and store nonce to validate ID token
+        $nonce = Str::random(22);
+        $this->request->session()->put('fc_nonce', $nonce);
 
-        return $this->buildAuthUrlFromBase($this->getBaseUrl().'/authorize', $state);
+        return $this->buildAuthUrlFromBase(
+            $this->getBaseUrl() . '/authorize',
+            $state
+        );
     }
 
+    /**
+     * {@inheritdoc}
+     */
+    protected function getCodeFields($state = null): array
+    {
+        $fields = parent::getCodeFields($state);
+
+        // custom acr and prompt or default
+        $fields['acr_values'] = $this->getConfig('acr_values') ?: 'eidas1';
+        $fields['prompt'] = $this->getConfig('prompt') ?: 'consent';
+
+        // include nonce for OIDC
+        $fields['nonce'] = $this->request->session()->get('fc_nonce');
+
+        return $fields;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
     protected function getTokenUrl(): string
     {
-        return $this->getBaseUrl().'/token';
+        return $this->getBaseUrl() . '/token';
     }
 
     /**
@@ -65,8 +93,9 @@ class Provider extends AbstractProvider
      */
     public function getAccessTokenResponse($code)
     {
-        $response = $this->getHttpClient()->post($this->getBaseUrl().'/token', [
-            RequestOptions::HEADERS     => ['Authorization' => 'Basic '.base64_encode($this->clientId.':'.$this->clientSecret)],
+        // Use Basic auth header and minimal body
+        $response = $this->getHttpClient()->post($this->getTokenUrl(), [
+            RequestOptions::HEADERS => ['Accept' => 'application/json'],
             RequestOptions::FORM_PARAMS => $this->getTokenFields($code),
         ]);
 
@@ -76,68 +105,96 @@ class Provider extends AbstractProvider
     /**
      * {@inheritdoc}
      */
-    public function user()
+    public function user(): User
     {
         if ($this->hasInvalidState()) {
             throw new InvalidStateException;
         }
 
         $response = $this->getAccessTokenResponse($this->getCode());
+        $accessToken = Arr::get($response, 'access_token');
 
-        $user = $this->mapUserToObject($this->getUserByToken(
-            $token = Arr::get($response, 'access_token')
-        ));
+        // optionally merge with userinfo
+        $userData = $this->getUserByToken($accessToken);
 
-        //store tokenId session for logout url generation
-        $this->request->session()->put('fc_token_id', Arr::get($response, 'id_token'));
+        /** @var \SocialiteProviders\Manager\OAuth2\User $user */
+        $user = $this->mapUserToObject($userData);
 
-        return $user->setTokenId(Arr::get($response, 'id_token'))
-            ->setToken($token)
-            ->setRefreshToken(Arr::get($response, 'refresh_token'))
-            ->setExpiresIn(Arr::get($response, 'expires_in'));
+        return $user
+            ->setAccessTokenResponseBody($response)
+            ->setToken($accessToken)
+            ->setRefreshToken(Arr::get($response, 'id_token'))
+            ->setExpiresIn(Arr::get($response, 'expires_in'))
+            ->setApprovedScopes(explode($this->scopeSeparator, $response['scope']));
     }
 
     /**
      * {@inheritdoc}
      */
-    protected function getUserByToken($token)
+    protected function getUserByToken($token): array
     {
-        $response = $this->getHttpClient()->get($this->getBaseUrl().'/userinfo', [
+        $response = $this->getHttpClient()->get($this->getBaseUrl() . '/userinfo', [
             RequestOptions::HEADERS => [
-                'Authorization' => 'Bearer '.$token,
+                'Authorization' => 'Bearer ' . $token,
+                'Accept'        => 'application/jwt',
             ],
         ]);
 
-        return json_decode((string) $response->getBody(), true);
+        $jwt = (string) $response->getBody();
+        $parts = explode('.', $jwt);
+
+        if (count($parts) < 2) {
+            throw new \RuntimeException('JWT invalide reçu de FranceConnect userinfo');
+        }
+
+        $payloadSegment = $parts[1];
+        $decodedJson    = JWT::jsonDecode(JWT::urlsafeB64Decode($payloadSegment));
+
+        return is_object($decodedJson) ? (array) $decodedJson : [];
     }
 
     /**
      * {@inheritdoc}
      */
-    protected function mapUserToObject(array $user)
+    protected function mapUserToObject(array $user): User
     {
-        return (new User)->setRaw($user)->map([
-            'id'                     => $user['sub'],
-            'given_name'             => $user['given_name'],
-            'family_name'            => $user['family_name'],
-            'gender'                 => $user['gender'],
-            'birthplace'             => $user['birthplace'],
-            'birthcountry'           => $user['birthcountry'],
-            'email'                  => $user['email'],
-            'preferred_username'     => $user['preferred_username'],
+        return (new User())->setRaw($user)->map([
+            'id' => Arr::get($user, 'sub'),
+            'nickname' => Arr::get($user, 'preferred_username', Arr::get($user, 'given_name')),
+            'name' => trim(Arr::get($user, 'given_name', '') . ' ' . Arr::get($user, 'family_name', '')) ?: null,
+            'given_name' => Arr::get($user, 'given_name'),
+            'family_name' => Arr::get($user, 'family_name'),
+            'email' => Arr::get($user, 'email'),
+            'gender' => Arr::get($user, 'gender'),
+            'birthplace' => Arr::get($user, 'birthplace'),
+            'birthcountry' => Arr::get($user, 'birthcountry'),
+            'preferred_username' => Arr::get($user, 'preferred_username'),
+            'avatar' => Arr::get($user, 'picture', null),
         ]);
     }
 
     /**
-     *  Generate logout URL for redirection to FranceConnect.
+     * Generate logout URL for FranceConnect end session.
      */
-    public function generateLogoutURL()
+    public function getLogoutUrl(string $idToken): string
     {
-        $params = [
-            'post_logout_redirect_uri' => $this->getConfig('logout_redirect'),
-            'id_token_hint'            => $this->request->session()->get('fc_token_id'),
-        ];
+        $postLogout = urlencode($this->getConfig('logout_redirect'));
 
-        return $this->getBaseUrl().'/logout?'.http_build_query($params);
+        return sprintf(
+            '%s/session/end?post_logout_redirect_uri=%s&id_token_hint=%s',
+            $this->getBaseUrl(),
+            $postLogout,
+            $idToken
+        );
+    }
+
+    /**
+     * Resolve base URL depending on environment config.
+     */
+    protected function getBaseUrl(): string
+    {
+        $env = $this->getConfig('environment') ?: config('app.env');
+
+        return self::URLS[$env === 'production' ? 'production' : 'integration'];
     }
 }
